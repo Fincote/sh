@@ -1,0 +1,118 @@
+name: finx.sh
+
+# finx.sh 是本仓库唯一由别处生成的脚本：它是 Fincote/Finx 里
+# finx-install/install.sh 的逐字节副本，只是换了个名字。
+# 所以这里不编辑它，只同步它 —— 改内容请改 Finx 仓库的
+# finx-install/install.sh.in 与 finx-install/lib/*.sh。
+
+on:
+  schedule:
+    # 上游改了而没人动这个仓库时，最迟一天后被发现
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/finx.yml'
+  pull_request:
+    paths:
+      - 'finx.sh'
+      - '.github/workflows/finx.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finx-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Fincote/Finx
+  UPSTREAM_REF: main
+  UPSTREAM_PATH: finx-install/install.sh
+  LOCAL_PATH: finx.sh
+
+jobs:
+  # 上游有新版本就拉过来提交。定时、手动，以及本工作流自身变更时运行。
+  sync:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the upstream copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/contents/$UPSTREAM_PATH?ref=$UPSTREAM_REF" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/upstream.sh"
+          echo "upstream: $(wc -c < "$RUNNER_TEMP/upstream.sh" | tr -d ' ') bytes"
+
+      - name: Compare
+        id: cmp
+        run: |
+          set -euo pipefail
+          if cmp -s "$RUNNER_TEMP/upstream.sh" "$LOCAL_PATH"; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "$LOCAL_PATH is up to date with $UPSTREAM@$UPSTREAM_REF"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "$LOCAL_PATH differs from $UPSTREAM@$UPSTREAM_REF"
+          fi
+
+      - name: Take the upstream copy
+        if: steps.cmp.outputs.drift == 'true'
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/upstream.sh" "$LOCAL_PATH"
+          chmod 0755 "$LOCAL_PATH"
+          bash -n "$LOCAL_PATH"
+          echo "syntax ok"
+
+      - name: Commit and push
+        if: steps.cmp.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM/commits/$UPSTREAM_REF" --jq .sha)
+          short=$(printf '%s' "$sha" | cut -c1-8)
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$LOCAL_PATH"
+          git commit -F - <<MSG
+          Sync $LOCAL_PATH with $UPSTREAM@$short
+
+          $UPSTREAM_PATH at $sha
+
+          Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+          MSG
+          git push
+
+  # 手改 finx.sh 的 PR 在这里被挡下：它一定会在下一次同步时被覆盖。
+  verify:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the upstream copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$UPSTREAM/contents/$UPSTREAM_PATH?ref=$UPSTREAM_REF" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/upstream.sh"
+
+      - name: Require finx.sh to match upstream
+        run: |
+          set -euo pipefail
+          if cmp -s "$RUNNER_TEMP/upstream.sh" "$LOCAL_PATH"; then
+            echo "$LOCAL_PATH matches $UPSTREAM@$UPSTREAM_REF"
+            exit 0
+          fi
+          echo "::error file=$LOCAL_PATH::$LOCAL_PATH is a generated copy of $UPSTREAM_PATH in $UPSTREAM. Change it there, not here."
+          diff -u "$RUNNER_TEMP/upstream.sh" "$LOCAL_PATH" || true
+          exit 1
