@@ -1069,6 +1069,48 @@ repair_alternatives() {
         || info "$(t 'rebuilt' '重建') $repaired $(t 'alternatives link(s)' '个 alternatives 链接')"
 }
 
+# 前缀落点策略。
+#
+# 沙箱外只认 /opt/finx。理由是硬的，不是偏好：
+#
+#   1. 二进制包不可重定位 —— dylib 的 install_name 与 dpkg 的 .list 都是绝对
+#      路径，装到别处得到的是一棵跑不起来的树（见 docs/PREFIX.md）。
+#   2. 安装器有两条会大量删改内容的路径：解包会覆盖同名文件，而符号链接围栏
+#      失败时会清空前缀的顶层内容。这两条作用在 /opt/finx 上只是重装；作用在
+#      /usr/local 上就是删掉整份 Homebrew，再 chown -R root:wheel 接管它。
+#
+# 判定按物理路径做。--prefix=/opt/../usr/local 在字符串上看着无害，实际落在
+# /usr/local —— MacWave 4.3 修的就是这一类，他们的校验也没做归一化。
+#
+# 沙箱里不设这条：apply_test_root 已经确认过前缀在测试根之内，那里的
+# 「前缀」是 $TEST_ROOT/opt/finx 这种路径。
+enforce_prefix_policy() {
+    case $PREFIX in
+        /opt/finx) return 0 ;;
+    esac
+
+    if [ -n "${FINX_TEST:-}" ]; then
+        return 0
+    fi
+
+    # 归一化之后再判一次：把 .. 与符号链接都折掉，让 /opt/../opt/finx 也算数。
+    real=$(resolve_path "$PREFIX")
+    case $real in
+        /opt/finx) PREFIX=$real; return 0 ;;
+    esac
+
+    # 多行文案的续行一律顶格：缩进它们会被 format_check 当成语句缩进。
+    die "$(t "the install prefix must be /opt/finx, not $real.
+Binary packages carry absolute paths, so a tree installed anywhere else does
+not run; and unpacking into a system directory would overwrite or delete what
+is already there.
+Remove --prefix to install to /opt/finx." \
+     "安装前缀只能是 /opt/finx，不能是 $real。
+二进制包写死了绝对路径，装到别处跑不起来；而解包进一个系统目录会覆盖、甚至
+删掉里面原有的东西。
+去掉 --prefix 即装到 /opt/finx。")"
+}
+
 write_config() {
     target=$1
     dist=$2
@@ -1369,7 +1411,9 @@ usage() {
     cat <<'USAGE'
 Usage: install.sh [options]
 
-  --prefix=DIR        install into DIR (default /opt/finx)
+  --prefix=DIR        install into DIR; DIR must be /opt/finx (the only
+                      supported location). Inside FINX_TEST the default is
+                      <test-root>/opt/finx and DIR must stay under it.
   --seed-dir=DIR      use a local manifest and seed; no network access
   --manifest-url=URL  absolute URL of the seed manifest
   --arch=ARCH         override the detected architecture (arm64 / x86_64)
@@ -1637,6 +1681,10 @@ main() {
 
     parse_args "$@"
     apply_test_root
+
+    # 在碰任何东西之前定下落点。放在 apply_test_root 之后，因为沙箱那条路
+    # 已经在前缀与测试根之间做过一次判定。
+    enforce_prefix_policy
 
     step "$(t 'Checking host' '正在检查主机')"
     detect_host
