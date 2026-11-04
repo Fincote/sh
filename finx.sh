@@ -104,6 +104,12 @@ export FINX_INDEX_DOMAIN
 FINX_SEED_DOMAIN=$(finx_domain FINX_SEED_DOMAIN "${FINX_SEED_DOMAIN:-https://finx.sh/finx/seed}") || exit 1
 export FINX_SEED_DOMAIN
 
+# 预编译 .deb 的取处。形状是 Bottle 式的「一包一 Release」：
+#   <域名>/<包名>/<包名>@<版本>-<修订>.darwin<Darwin>-<架构>.deb
+# 默认指向我们自己的 debs 仓库。镜像站只要提供「域名之后那两段」的相对路径。
+FINX_DEB_DOMAIN=$(finx_domain FINX_DEB_DOMAIN "${FINX_DEB_DOMAIN:-https://github.com/Fincote/debs/releases/download}") || exit 1
+export FINX_DEB_DOMAIN
+
 # 源码自举时取源码归档的地方，默认 GitHub 的 codeload。
 FINX_SOURCE_DOMAIN=$(finx_domain FINX_SOURCE_DOMAIN "${FINX_SOURCE_DOMAIN:-https://codeload.github.com/Fincote/Finx}") || exit 1
 export FINX_SOURCE_DOMAIN
@@ -497,6 +503,15 @@ probe_url() {
     url=$1
     tries=${FINX_PROBE_TRIES:-3}
 
+    # file:// 不走网络，curl -I 也能取到，但拿回来的 http_code 是 000，
+    # 于是「文件明明在」被判定成「连不上」。FINX_INDEX_DOMAIN 接受 file://
+    # （离线测试、本地镜像都靠它），这条路径必须能一致地探到。
+    case $url in
+        file://*)
+            [ -f "${url#file://}" ] && return 0
+            return 1 ;;
+    esac
+
     PROBE_ATTEMPTS=0
     total=$tries
     while [ "$tries" -gt 0 ]; do
@@ -554,9 +569,13 @@ resolve_manifest() {
     schema=$(manifest_field "$MANIFEST_FILE" schema)
     [ "$schema" = "1" ] || die "unsupported manifest schema: ${schema:-<missing>}"
 
+    # 清单存在不等于种子能用：种子是按 arch 与 darwin 构建的，别的机器上的
+    # 种子装不进来。自动发现时要把这件事当成「这份种子不是给你的」，退回源码；
+    # 显式指定来源时仍然直接拒绝 —— 调用方说了就用这份，静默换源会让校验失去意义。
     manifest_arch=$(manifest_field "$MANIFEST_FILE" arch)
-    [ "$manifest_arch" = "$HOST_ARCH" ] \
-        || die "seed is built for $manifest_arch but this host is $HOST_ARCH"
+    if [ "$manifest_arch" != "$HOST_ARCH" ]; then
+        SEED_HOST_MISMATCH="seed is built for $manifest_arch but this host is $HOST_ARCH"
+    fi
 
     SEED_RELEASE=$(manifest_field "$MANIFEST_FILE" release)
     SEED_NAME=$(manifest_field "$MANIFEST_FILE" seed)
@@ -577,6 +596,11 @@ resolve_manifest() {
     esac
 
     check_darwin_floor
+
+    if [ -n "${SEED_HOST_MISMATCH:-}" ]; then
+        [ "${SEED_MAY_FALL_BACK:-0}" -eq 1 ] || die "$SEED_HOST_MISMATCH"
+        return 0
+    fi
 
     ARTIFACT_FILE=$FINX_TMP/$SEED_NAME
     info "$(t 'seed' '种子') $SEED_NAME ($(t 'release' '版本') ${SEED_RELEASE:-unknown}, $(human_size "$SEED_SIZE"))"
@@ -604,7 +628,7 @@ check_darwin_floor() {
 
     msg=$(t "this seed was built on a newer macOS (Darwin $SEED_DARWIN); this system is Darwin $host" \
             "这个种子是在更新的 macOS 上构建的（Darwin $SEED_DARWIN），本机是 Darwin $host")
-    die "$msg"
+    SEED_HOST_MISMATCH=$msg
 }
 
 manifest_field() {
@@ -1478,6 +1502,9 @@ resolve_method() {
     case $? in
         0)
             MODE=seed
+            # 清单在，但种子未必是给这台机器的（arch / darwin 不匹配）。允许换路，
+            # 交给 resolve_manifest 判定后回退源码；--no-fallback 与显式来源不换。
+            SEED_MAY_FALL_BACK=1
             info "$(t 'seed, from' '种子，来自') $MANIFEST_URL" ;;
         1)
             MODE=source
@@ -1529,6 +1556,16 @@ resolve_method() {
 install_from_seed() {
     step "$(t 'Resolving seed manifest' '解析种子清单')"
     resolve_manifest
+
+    # 种子的清单存在，却与这台机器不匹配。把它当成「没有可用的种子」，而不是
+    # 一个致命错误：用户要的是装上 Finx，不是拿到一份错误信息。
+    if [ -n "${SEED_HOST_MISMATCH:-}" ]; then
+        warn "$(t 'this seed cannot be used here' '这份种子在本机用不了')"
+        warn "  $SEED_HOST_MISMATCH"
+        warn "$(t 'building from source instead' '改为源码自举')"
+        install_from_source
+        return 0
+    fi
 
     step "$(t 'Checking target' '检查目标目录')"
     check_target
