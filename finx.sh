@@ -51,6 +51,31 @@ on_exit() {
 }
 
 # ---------------------------------------------------------------------------
+# 屏幕输出：颜色与横幅
+# ---------------------------------------------------------------------------
+#
+# 用 echo -e：脚本的 shebang 是 bash（见 62529dd5 统一过），bash 内建的 echo
+# 认 -e。项目约定如此，横幅内容也不含需要转义的东西。
+
+RED_BOLD='\033[1;31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RESET='\033[0m'
+
+print_banner() {
+    echo ""
+    echo -e "${GREEN}███████╗██╗███╗   ██╗██╗  ██╗${RESET}"
+    echo -e "${GREEN}██╔════╝██║████╗  ██║╚██╗██╔╝${RESET}"
+    echo -e "${GREEN}█████╗  ██║██╔██╗ ██║ ╚███╔╝ ${RESET}"
+    echo -e "${GREEN}██╔══╝  ██║██║╚██╗██║ ██╔██╗ ${RESET}"
+    echo -e "${GREEN}██║     ██║██║ ╚████║██╔╝ ██╗${RESET}"
+    echo -e "${GREEN}╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝${RESET}"
+    echo ""
+    echo -e "${GREEN}$(t 'Welcome to FINX!' '欢迎使用 FINX！')${RESET}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # 下载源：全部由环境变量控制
 # ---------------------------------------------------------------------------
 #
@@ -1449,16 +1474,19 @@ main() {
     case ${FINX_LANG:-} in
         zh|zh_CN|zh-CN) ZH=1 ;;
     esac
+
+    print_banner
+
     parse_args "$@"
     apply_test_root
 
-    step "$(t 'Checking host' '检查主机')"
+    step "$(t 'Checking host' '正在检查主机')"
     detect_host
     [ -n "$ARCH_OVERRIDE" ] && HOST_ARCH=$ARCH_OVERRIDE
     info "macOS $HOST_MACOS_MAJOR, arch $HOST_ARCH, prefix $PREFIX"
     require curl
 
-    step "$(t 'Choosing install method' '选择安装方式')"
+    step "$(t 'Detecting the install method' '正在自动选择安装方式')"
     resolve_method
 
     case $MODE in
