@@ -360,6 +360,16 @@ lower() {
 
 # 规范化路径：存在就 pwd -P，不存在就把最深的已存在祖先规范化后接回剩余部分。
 # macOS 上 /tmp 是指向 /private/tmp 的符号链接，不这么做比对会假阴性。
+# 把 URL 里的凭据抹掉再打印。
+#
+# 镜像可以带账号：FINX_SEED_DOMAIN=https://user:pass@mirror/finx。安装器会把
+# 它打印出来（GET 行、失败提示、清单地址），而终端输出会进 CI 日志、截图、
+# issue —— 密码就这么跟着走了。只抹 userinfo，其余原样保留，否则报错里看不出
+# 是哪个主机。
+redact_url() {
+    printf '%s\n' "$1" | sed -E 's|^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@|\1***:***@|'
+}
+
 resolve_path() {
     target=$1
     current=$target
@@ -684,7 +694,7 @@ resolve_manifest() {
         MANIFEST_FILE=$FINX_TMP/manifest
         ARTIFACT_BASE=""
         fetch_one "$MANIFEST_URL" "$MANIFEST_FILE" quiet \
-            || die "$(t 'cannot download the seed manifest from' '下载种子清单失败：') $MANIFEST_URL"
+            || die "$(t 'cannot download the seed manifest from' '下载种子清单失败：') $(redact_url "$MANIFEST_URL")"
     fi
 
     [ -f "$MANIFEST_FILE" ] || die "manifest not found: $MANIFEST_FILE"
@@ -769,7 +779,7 @@ fetch_one() {
     # 第三个参数：quiet 表示文件很小（清单），不要画进度。
     quiet=${3:-}
 
-    info "GET $url"
+    info "GET $(redact_url "$url")"
 
     # 进度显示分两档：
     #   quiet       -sS，只留真正的错误。清单就两百字节，画个进度表很荒唐
@@ -821,7 +831,7 @@ fetch_artifact() {
     # 环境变量就能用，不必为每种布局各维护一份清单。
     if [ ! -s "$FINX_TMP/urls" ]; then
         printf '%s/%s\n' "$FINX_SEED_DOMAIN" "$SEED_NAME" > "$FINX_TMP/urls"
-        info "manifest has no url entries; falling back to $FINX_SEED_DOMAIN"
+        info "manifest has no url entries; falling back to $(redact_url "$FINX_SEED_DOMAIN")"
     fi
 
     tried=0
@@ -831,7 +841,7 @@ fetch_artifact() {
         if fetch_one "$url" "$ARTIFACT_FILE"; then
             return 0
         fi
-        warn "mirror failed: $url"
+        warn "mirror failed: $(redact_url "$url")"
     done < "$FINX_TMP/urls"
 
     die "$(t 'all mirror(s) failed for' '所有镜像都下载失败：') $SEED_NAME"
@@ -1742,7 +1752,7 @@ resolve_method() {
     MANIFEST_URL=$DEFAULT_MANIFEST_URL
     # 探测最多要一两分钟（重试 + 超时），期间不能一声不响 —— 用户会以为卡死。
     info "$(t 'looking for a seed manifest' '正在查找种子清单')"
-    info "  $MANIFEST_URL"
+    info "  $(redact_url "$MANIFEST_URL")"
     probe_url "$MANIFEST_URL"
     case $? in
         0)
@@ -1750,10 +1760,10 @@ resolve_method() {
             # 清单在，但种子未必是给这台机器的（arch / darwin 不匹配）。允许换路，
             # 交给 resolve_manifest 判定后回退源码；--no-fallback 与显式来源不换。
             SEED_MAY_FALL_BACK=1
-            info "$(t 'seed, from' '种子，来自') $MANIFEST_URL" ;;
+            info "$(t 'seed, from' '种子，来自') $(redact_url "$MANIFEST_URL")" ;;
         1)
             MODE=source
-            warn "no seed manifest at $MANIFEST_URL yet; falling back to a source build"
+            warn "no seed manifest at $(redact_url "$MANIFEST_URL") yet; falling back to a source build"
             warn "that path needs the Xcode Command Line Tools and compiles tar and dpkg" ;;
         *)
             # 探不出来 ≠ 没有种子。源码那条路要去 SourceForge 下载，连不上
@@ -1770,7 +1780,7 @@ resolve_method() {
             printf '\n' >&2
             printf 'ERROR: cannot reach the seed manifest after %s attempt(s).\n' \
                 "${PROBE_ATTEMPTS:-?}" >&2
-            printf '         %s\n' "$MANIFEST_URL" >&2
+            printf '         %s\n' "$(redact_url "$MANIFEST_URL")" >&2
             printf '\n' >&2
             printf 'Nothing was installed.  This is a network problem, not a missing seed:\n' >&2
             printf 'that manifest is a small text file, and the seed behind it is larger.\n' >&2
