@@ -60,6 +60,8 @@ on_exit() {
 RED_BOLD='\033[1;31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
+BOLD_BLUE='\033[1;38;5;25m'
+BOLD='\033[1m'
 RESET='\033[0m'
 
 print_banner() {
@@ -160,7 +162,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 step() {
-    printf '\n==> %s\n' "$*"
+    echo ""
+    echo -e "${BOLD_BLUE}==>${RESET} ${BOLD}$*${RESET}"
 }
 
 # 中英对照。--zh（或 FINX_LANG=zh）时取中文，否则取英文。
