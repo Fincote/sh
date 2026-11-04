@@ -981,6 +981,56 @@ align_trees() {
     fi
 }
 
+# 修复 bootstrap 时代留下的 alternatives 链接。
+#
+# 种子里 bin/lzdiff、bin/lzgrep 与它们两个 man 页是绝对链接，指向
+# <prefix>/bootstrap/etc/alternatives/... —— 而 bootstrap/ 在收尾时被删掉了，
+# 于是装完就是死链：`lzdiff --version` 报 No such file or directory。
+#
+# 数据库本身是好的（var/lib/dpkg/alternatives 里记的路径都指向前缀），缺的只是
+# 主链接和 bin 下那条链接的内容。所以让 update-alternatives 照数据库自己重建，
+# 比在安装器里硬编码 lzdiff 这些名字靠得住 —— 将来哪个包用了 alternatives 都
+# 一并修好。这里也修得动已经发出去的种子，不必重打。
+repair_alternatives() {
+    target=$1
+    admin=$target/var/lib/dpkg/alternatives
+    tool=$target/bin/update-alternatives
+    [ -x "$tool" ] || return 0
+    [ -d "$admin" ] || return 0
+
+    repaired=0
+    for entry in "$admin"/*; do
+        [ -f "$entry" ] || continue
+        name=${entry##*/}
+        # 数据库第一行是状态，第二行是主链接。构建机写的是绝对路径。
+        link=$(sed -n '2p' "$entry")
+        case $link in
+            "$target"/*) ;;
+            *)
+                warn "$(t "alternatives: $name points at $link, outside $target; left alone" \
+                         "alternatives: $name 指向 $link，不在 $target 里，未改动")"
+                continue ;;
+        esac
+        # 链接还能用就别动：用户可能手工选过候选项，重装不该悄悄改回去。
+        [ -e "$link" ] && continue
+
+        mkdir -p "$target/var/log" 2>/dev/null
+        # --admindir / --altdir / --log 三个都要显式给：这个二进制把
+        # /opt/finx 编死在代码里，不覆盖就会去改真正的前缀，而不是 $target。
+        if "$tool" --admindir "$admin" --altdir "$target/etc/alternatives" \
+                --log "$target/var/log/alternatives.log" --auto "$name" \
+                >/dev/null 2>&1; then
+            repaired=$((repaired + 1))
+        else
+            warn "$(t "alternatives: could not rebuild the link for $name" \
+                     "alternatives: 没能重建 $name 的链接")"
+        fi
+    done
+
+    [ "$repaired" -eq 0 ] \
+        || info "$(t 'rebuilt' '重建') $repaired $(t 'alternatives link(s)' '个 alternatives 链接')"
+}
+
 write_config() {
     target=$1
     dist=$2
@@ -1691,6 +1741,7 @@ install_from_seed() {
     fix_permissions "$PREFIX"
     resign_macho "$PREFIX"
     align_trees "$PREFIX" "$(host_distribution)"
+    repair_alternatives "$PREFIX"
     write_config "$PREFIX" "$(host_distribution)"
     run_scanpackages "$PREFIX"
 
