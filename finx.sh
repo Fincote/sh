@@ -166,6 +166,63 @@ step() {
     echo -e "${BOLD_BLUE}==>${RESET} ${BOLD}$*${RESET}"
 }
 
+# 许可协议确认。
+#
+# 放在**动手之前**，不是装完之后。理由：拒签时不需要回滚。
+# MacWave 把确认放在收尾，是因为它的安装是用户级的、要改 shell 启动文件，
+# 拒签必须把已装目录与 PATH 行一起删掉。这里放在最前面，拒签时系统一个字节都
+# 没被碰过，「未安装任何内容」是字面意义上的真话，而不是一句安慰。
+#
+# 三道门，按顺序：
+#   1. --accept-license  → 显式同意，不再问（给脚本与自动化用）
+#   2. FINX_TEST 沙箱    → 自动同意并说明（那里本来就不会碰真实系统）
+#   3. 其余              → 读 /dev/tty 问一次
+#
+# 为什么读 /dev/tty 而不是 stdin：`curl | sudo bash` 时 stdin 是脚本自身，
+# 读它会吃掉脚本剩下的内容。这也是 MacWave 用 /dev/tty 的原因。
+license_gate() {
+    if [ "$ACCEPT_LICENSE" -eq 1 ]; then
+        info "$(t 'agreement accepted with --accept-license' '已用 --accept-license 接受协议')"
+        return 0
+    fi
+
+    if [ -n "${FINX_TEST:-}" ]; then
+        info "$(t 'sandbox run: the agreement is accepted automatically' \
+                 '沙箱运行：自动接受协议')"
+        return 0
+    fi
+
+    warn "$(t 'Finx is released under the GPL v2. Read both files before you agree:
+    LICENSE   which part of the tree carries which grant
+    COPYING   the licence text itself
+    https://finx.sh/#license-en' \
+     'Finx 以 GPL v2 发布。同意之前请先读这两个文件：
+    LICENSE   哪些目录适用哪个授权
+    COPYING   许可证正文
+    https://finx.sh/#license')"
+
+    # 不能用 `[ -r /dev/tty ]`：那查的是权限，而设备节点谁都「可读」。
+    # 没有控制终端时 access(R_OK) 仍然成功，打开才失败（ENXIO）。
+    # 实测过：写成 [ -r ] 时门形同虚设，`curl | sudo bash` 会直接越过协议确认。
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        die "$(t 'no terminal to ask for agreement, so --accept-license is required.
+Re-run interactively, or pass --accept-license after reading both files.' \
+         '没有终端可以询问协议，因此必须显式传入 --accept-license。
+请改为交互运行，或在读过这两个文件后传入 --accept-license。')"
+    fi
+
+    printf '%s ' "$(t 'Have you read and agree to it? [Y/n]' '你是否已阅读并同意？[Y/n]')" >&3
+    answer=""
+    read -r answer <&3 || answer=""
+    exec 3<&-
+
+    case $answer in
+        ''|y|Y|yes|YES) info "$(t 'agreement accepted' '已记录你的同意')" ;;
+        *) die "$(t 'you did not accept the agreement; nothing was installed.' \
+                   '你未同意该协议，未安装任何内容。')" ;;
+    esac
+}
+
 # 中英对照。--zh（或 FINX_LANG=zh）时取中文，否则取英文。
 #
 # 只覆盖安装器自己的话：step 标题、错误、以及收尾提示。curl 的进度条、
@@ -1202,6 +1259,7 @@ run_bootstrap() {
 PREFIX=/opt/finx
 PREFIX_EXPLICIT=0
 NO_PATH=0
+ACCEPT_LICENSE=0
 SEED_DIR=""
 MANIFEST_URL=${FINX_MANIFEST_URL:-}
 ARCH_OVERRIDE=""
@@ -1231,6 +1289,8 @@ Usage: install.sh [options]
   --ref=REF           branch or commit for the default source archive (default: main)
   --no-fallback       fail when no seed is reachable instead of building from source
   --no-path           leave your shell startup file alone
+  --accept-license    state that you have read and accept the agreement;
+                      required when there is no terminal to ask (scripts, CI)
   --zh                print steps and errors in Chinese (for self-diagnosis;
                       tool output such as curl and compilers stays English)
   --verbose           stream the bootstrap output instead of logging it
@@ -1287,6 +1347,7 @@ parse_args() {
             --ref)            shift; [ $# -gt 0 ] || die "--ref needs a value"; SOURCE_REF=$1 ;;
             --no-fallback)    ALLOW_FALLBACK=0 ;;
             --no-path)        NO_PATH=1 ;;
+            --accept-license) ACCEPT_LICENSE=1 ;;
             --zh)             ZH=1 ;;
             --verbose)        VERBOSE=1 ;;
             --force)          FORCE=1 ;;
@@ -1483,6 +1544,9 @@ main() {
     parse_args "$@"
     apply_test_root
 
+    # 许可协议必须在碰系统之前：拒签时无需回滚。
+    license_gate
+
     step "$(t 'Checking host' '正在检查主机')"
     detect_host
     [ -n "$ARCH_OVERRIDE" ] && HOST_ARCH=$ARCH_OVERRIDE
@@ -1502,6 +1566,11 @@ main() {
     setup_path
     info "$(t 'Package operations run as root, like MacPorts; finx asks for sudo itself.' \
              '装包操作以 root 运行（与 MacPorts 相同），finx 会自己调用 sudo。')"
+    printf '\n'
+    info "$(t 'Read LICENSE and COPYING again any time, in English or in Chinese:' \
+             'LICENSE 与 COPYING 随时可再读，中英各一版：')"
+    info "$(t '  https://finx.sh   the two file names at the bottom open them.' \
+             '  https://finx.sh   点开页面底部那两个文件名即可。')"
 }
 
 # 种子优先，取不到再退回源码。显式给了 --seed-dir / --manifest-url 时不回落，
