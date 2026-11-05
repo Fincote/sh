@@ -2,17 +2,20 @@
 #
 # finx-install/install.sh - 从零安装 Finx
 #
-# 本文件由 finx-install/build-bundle.sh 生成，请勿直接编辑。
-# 唯一事实来源：finx-install/install.sh.in 与 finx-install/lib/*.sh
+# 这是**唯一源文件**，直接编辑它。用户 curl 的也是它。
+#
+# 曾经拆成 install.sh.in + lib/*.sh 再由 build-bundle.sh 拼成单文件 ——
+# 那套机制已经去掉：单文件 2000 行可以直接维护，而模板 + 生成物 + 同步校验
+# 带来的麻烦（改了生成物会被下次构建静默覆盖）超过它省下的力气。
 #
 # 用法：/bin/bash -c "$(curl -fsSL <本文件的地址>)" -- [选项]
 #
 
-FINX_BUNDLED=1
+set -eE
 set -u
 set -o pipefail
 
-# ======== lib/common.sh ========
+# ---- 输出、错误、trap、临时目录 -------------------------------------------
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -131,6 +134,14 @@ export FINX_INDEX_DOMAIN
 FINX_SEED_DOMAIN=$(finx_domain FINX_SEED_DOMAIN "${FINX_SEED_DOMAIN:-https://finx.sh/finx/seed}") || exit 1
 export FINX_SEED_DOMAIN
 
+# 种子放在哪。默认 GitHub Releases；自建镜像按同样布局提供即可：
+#   <基址>/seed-<Darwin>/manifest
+#   <基址>/seed-<Darwin>/seed.tar.gz
+# 单独抽出来有两个理由：安装器要「往下试更老的种子」，得能拼出多个地址；
+# 测试要能用 file:// 模拟「本机这一版没有、低一档有」。
+FINX_SEED_BASE=$(finx_domain FINX_SEED_BASE "${FINX_SEED_BASE:-https://github.com/Fincote/Finx/releases/download}") || exit 1
+export FINX_SEED_BASE
+
 # 预编译 .deb 的取处。形状是 Bottle 式的「一包一 Release」：
 #   <域名>/<包名>/<包名>@<版本>-<修订>.darwin<Darwin>-<架构>.deb
 # 默认指向我们自己的 debs 仓库。镜像站只要提供「域名之后那两段」的相对路径。
@@ -168,8 +179,8 @@ step() {
 
 # 许可协议确认。
 #
-# 位置与 MacWave 一致：装完了，但还没告诉用户「装好了」，也还没碰 shell 的
-# 启动文件。先宣告成功再因为不同意而删掉，是最难看的顺序。
+# 位置与 MacWave 一致：装完了，但还没告诉用户「装好了」。先宣告成功再因为
+# 不同意而删掉，是最难看的顺序。
 #
 # 三道门，按顺序：
 #   1. --ci（或 --accept-license）→ 自动同意并说明（给脚本与自动化用）
@@ -179,6 +190,11 @@ step() {
 # 为什么读 /dev/tty 而不是 stdin：`curl | sudo bash` 时 stdin 是脚本自身，
 # 读它会吃掉脚本剩下的内容。这也是 MacWave 用 /dev/tty 的原因。
 license_gate() {
+    if dry_run; then
+        plan "$(t 'ask you to accept the licence' '询问是否接受许可协议')"
+        return 0
+    fi
+
     if [ "$CI" -eq 1 ]; then
         if [ "$ACCEPT_LICENSE" -eq 1 ]; then
             info "$(t 'agreement accepted with --accept-license' \
@@ -309,6 +325,25 @@ run() {
     "$@"
 }
 
+# ---- 试运行 ---------------------------------------------------------------
+#
+# 走完整条流程、把每一步会做什么打出来，但不下载、不建目录、不写文件、
+# 不提权。仿 MacWave 的 install.sh：一个判断函数 + 一个打印函数，调用点
+# 因此不必自己套 if，也就不容易漏。
+#
+# 为什么不在最外层拦一道就算了：那样只能打印一份笼统的计划，用户看不到
+# 解包、重签名、写配置这些具体步骤。而漏掉某个写点的后果更糟 —— 变成
+# 「说好只是预演，实际却动了东西」，这个安装器早期版本正是这么错的。
+dry_run() {
+    [ "${DRY_RUN:-0}" -eq 1 ]
+}
+
+# 试运行时把「本来会发生什么」打出来；不在试运行时一个字都不输出。
+plan() {
+    dry_run || return 0
+    info "$(t 'would' '将会') $*"
+}
+
 ensure_tmp() {
     if [ -z "$FINX_TMP" ]; then
         # macOS 的 TMPDIR 自带末尾斜杠，直接拼会得到 "T//finx-install"
@@ -412,11 +447,6 @@ apply_test_root() {
     # 沙箱里装的都是假东西，源码自举那条路不该向用户要 root
     IN_TEST_ROOT=1
 
-    # 沙箱也绝不能碰真的 shell 配置。FINX_TEST 只管前缀与 TMPDIR，而收尾
-    # 会往 $HOME 的启动文件里写 PATH —— 不拦的话，跑一次自测就改了开发者
-    # 本人的 .zprofile。写 PATH 那条逻辑由 selftest 用假 HOME 单独测。
-    NO_PATH=1
-
     if [ "${PREFIX_EXPLICIT:-0}" -eq 1 ]; then
         prefix_real=$(resolve_path "$PREFIX")
         case $prefix_real in
@@ -430,7 +460,7 @@ apply_test_root() {
     info "$(t 'test root' '测试根'): $TEST_ROOT $(t '(nothing outside it will be touched)' '（其外不会被改动）')"
 }
 
-# ======== lib/detect.sh ========
+# ---- 宿主探测与目标目录 ---------------------------------------------------
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -527,6 +557,12 @@ require_write_access() {
         probe=$(nearest_existing_parent "$target")
     fi
     if [ ! -w "$probe" ] && [ "$(id -u)" -ne 0 ]; then
+        if dry_run; then
+            # 预演本来就不提权，也不该因为「要 sudo」停下来 —— 那正是它要告诉
+            # 用户的事。这里只说一句，然后继续打后面的步骤。
+            warn "$(t 'a real run would need root to write into' '真正安装需要 root 才能写入') $probe"
+            return 0
+        fi
         # 说清楚「怎么带 sudo」。其中管道那种最容易踩：`curl ... | sudo bash`
         # 而不是 `sudo curl ... | bash`（后者只有 curl 是 root，bash 不是）。
         printf 'ERROR: %s %s %s, %s\n' \
@@ -551,10 +587,14 @@ require_write_access() {
 }
 
 do_mkdir() {
+    if dry_run; then
+        plan "$(t 'create' '建立') $1"
+        return 0
+    fi
     run mkdir -p -m 755 "$1"
 }
 
-# ======== lib/manifest.sh ========
+# ---- 种子清单：解析、下载、校验 -------------------------------------------
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -613,10 +653,14 @@ else
     #   releases/download/seed-24/manifest     macOS 15
     #   releases/download/seed-21/manifest     macOS 12
     #
-    # URL 里带 arch 与 darwin，是为了让缓存与 CDN 自然分开，也便于人工核对。
-    DEFAULT_MANIFEST_URL=https://github.com/Fincote/Finx/releases/download/\
-seed-$_finx_darwin/manifest
+    # 这里只给「本机那一版」的地址。往下找更低版本是 resolve_method 的事 ——
+    # 它手上有 probe_url，能逐个试；这里只是一个起点。
+    DEFAULT_MANIFEST_URL=$FINX_SEED_BASE/seed-$_finx_darwin/manifest
 fi
+
+# 本机 Darwin 主版本，供 resolve_method 往下找时用。
+FINX_HOST_DARWIN=$_finx_darwin
+export FINX_HOST_DARWIN
 
 # 只探存在性，不下载全文。用于决定走种子还是走源码。
 #
@@ -632,17 +676,36 @@ fi
 # 而真正该做的是检查代理或换镜像。
 #
 # 重试是必要的：实测同一条命令前一分钟能取到清单，下一分钟就 connect timeout。
+#
+# 结果放进 PROBE_RESULT，取值只有三个字面量：
+#
+#   exists    地址在（2xx/3xx）
+#   absent    服务端明确说没有（404/410）
+#   unknown   探不出来（连不上、超时、被 403/429 拦住、以及一切没预料到的情况）
+#
+# **函数本身永远 return 0**，调用方读 $PROBE_RESULT，不读退出码。
+#
+# 为什么不沿用「0/1/2 三种退出码」：退出码没有语义，任何一处意外的失败都可能
+# 恰好是 1，于是一个本该报「探不出来」的故障会被当成「这一档没有种子」——
+# 结果是一路往下试到最低那一档，再默默回退去编译半小时。那种错误不报错，
+# 只是慢，最难发现。用三态字符串，未预料的情况只能落到 unknown。
 probe_url() {
     url=$1
     tries=${FINX_PROBE_TRIES:-3}
+
+    PROBE_RESULT=unknown
 
     # file:// 不走网络，curl -I 也能取到，但拿回来的 http_code 是 000，
     # 于是「文件明明在」被判定成「连不上」。FINX_INDEX_DOMAIN 接受 file://
     # （离线测试、本地镜像都靠它），这条路径必须能一致地探到。
     case $url in
         file://*)
-            [ -f "${url#file://}" ] && return 0
-            return 1 ;;
+            if [ -f "${url#file://}" ]; then
+                PROBE_RESULT=exists
+            else
+                PROBE_RESULT=absent
+            fi
+            return 0 ;;
     esac
 
     PROBE_ATTEMPTS=0
@@ -668,16 +731,17 @@ probe_url() {
         esac
 
         case $code in
-            2??|3??) return 0 ;;
+            2??|3??) PROBE_RESULT=exists; return 0 ;;
             # 只有这两个码能断定「确实没有」。403/429/451 是「被拦下了」，
             # 不是「不存在」—— 把它们当成不存在，用户就会被送去源码自举。
-            404|410) return 1 ;;
+            404|410) PROBE_RESULT=absent; return 0 ;;
         esac
 
         tries=$((tries - 1))
         [ "$tries" -gt 0 ] && sleep 2
     done
-    return 2
+    PROBE_RESULT=unknown
+    return 0
 }
 
 # 解析清单，设置 MANIFEST_FILE / ARTIFACT_BASE / ARTIFACT_FILE /
@@ -817,6 +881,11 @@ fetch_one() {
 
 # 取得种子产物：本地目录直接拷贝，否则按清单里的 url 逐个尝试。
 fetch_artifact() {
+    if dry_run; then
+        plan "$(t 'download' '下载') $SEED_NAME ($(human_size "${SEED_SIZE:-0}"))"
+        return 0
+    fi
+
     if [ -n "$ARTIFACT_BASE" ]; then
         src=$ARTIFACT_BASE/$SEED_NAME
         [ -f "$src" ] || die "seed artifact not found: $src"
@@ -853,6 +922,11 @@ verify_file() {
     want_sha=$2
     want_size=$3
 
+    if dry_run; then
+        plan "$(t 'check its sha256 and size' '校验 sha256 与大小') ($(human_size "${want_size:-0}"))"
+        return 0
+    fi
+
     [ -f "$file" ] || die "$(t 'file is missing:' '缺少文件：') $file"
 
     got_size=$(file_size "$file")
@@ -866,7 +940,7 @@ verify_file() {
     info "$(t 'sha256 ok' 'sha256 校验通过')"
 }
 
-# ======== lib/extract.sh ========
+# ---- 解包、权限、重签名、写配置 -------------------------------------------
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -890,6 +964,13 @@ verify_file() {
 extract_seed() {
     archive=$1
     target=$2
+
+    # 试运行的守卫必须在文件检查之前：`--dry-run` 不下载、也不拷本地种子，
+    # ARTIFACT_FILE 那个文件根本不存在，先检查就会把试运行判成失败。
+    if dry_run; then
+        plan "$(t 'extract' '解开') $archive $(t 'into' '到') $target"
+        return 0
+    fi
 
     [ -f "$archive" ] || die "seed archive missing: $archive"
     [ -d "$target" ] || die "target directory missing: $target"
@@ -921,6 +1002,10 @@ $offending
 # 因此以 root 安装时统一归一为 root:wheel；非 root 只可能发生在 FINX_TEST
 # 沙箱或用户自己拥有的前缀里，此时不动归属。
 fix_permissions() {
+    if dry_run; then
+        plan "$(t 'set ownership and modes under' '规范权限') $target"
+        return 0
+    fi
     target=$1
 
     if [ "$(id -u)" -eq 0 ]; then
@@ -950,6 +1035,10 @@ is_macho() {
 
 # 改动过二进制的种子必须重签名：Apple 芯片拒跑签名失效的可执行文件。
 resign_macho() {
+    if dry_run; then
+        plan "$(t 'ad-hoc re-sign the Mach-O files under' '重签 Mach-O') $target"
+        return 0
+    fi
     target=$1
 
     if ! have codesign; then
@@ -978,6 +1067,10 @@ resign_macho() {
 # 下次再跑还会撞上 "does not look like a Finx installation"。
 require_seed_payload() {
     archive=$1
+    if dry_run; then
+        plan "$(t 'confirm the archive really contains' '确认归档里有') bin/finx bin/dpkg bin/dpkg-deb"
+        return 0
+    fi
     listing=$FINX_TMP/seed-members
     # 成员名可能带 ./ 前缀（`tar -C dir .` 会这样），也可能不带。先归一化再比，
     # 否则同一种归档换个打包方式就判定失败。
@@ -1013,6 +1106,10 @@ host_distribution() {
 align_trees() {
     target=$1
     dist=$2
+    if dry_run; then
+        plan "$(t 'point the tree links in' '对齐 trees') $target/finx $(t 'at' '到') $dist"
+        return 0
+    fi
     base=$target/finx
     [ -d "$base/10.9-libcxx" ] || return 0    # 不是标准布局，什么都不动
 
@@ -1041,6 +1138,10 @@ align_trees() {
 # 一并修好。这里也修得动已经发出去的种子，不必重打。
 repair_alternatives() {
     target=$1
+    if dry_run; then
+        plan "$(t 'repair dangling alternatives links in' '修补 alternatives 链接') $target"
+        return 0
+    fi
     admin=$target/var/lib/dpkg/alternatives
     tool=$target/bin/update-alternatives
     [ -x "$tool" ] || return 0
@@ -1124,6 +1225,10 @@ Remove --prefix to install to /opt/finx." \
 write_config() {
     target=$1
     dist=$2
+    if dry_run; then
+        plan "$(t 'write' '写入') $target/etc/finx.conf"
+        return 0
+    fi
     conf=$target/etc/finx.conf
 
     if [ -e "$conf" ]; then
@@ -1154,6 +1259,10 @@ EOF
 }
 
 run_scanpackages() {
+    if dry_run; then
+        plan "$(t 'rebuild the package index in' '重建包索引') $target"
+        return 0
+    fi
     target=$1
 
     if [ ! -x "$target/bin/finx" ]; then
@@ -1165,7 +1274,7 @@ run_scanpackages() {
     return 0
 }
 
-# ======== lib/links.sh ========
+# ---- 载荷符号链接的落点校验 -----------------------------------------------
 #
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
@@ -1256,7 +1365,7 @@ $(find "$_root" -type l 2>/dev/null)
 EOF
 }
 
-# ======== lib/source.sh ========
+# ---- 源码回落 -------------------------------------------------------------
 # Copyright (c) 2026 Sha0huaZhang <zsh@finx.sh>
 #
 # This program is free software; you can redistribute it and/or modify
@@ -1297,6 +1406,11 @@ fetch_source() {
     src_url=${SOURCE_URL:-$(default_source_url)}
     info "source $src_url"
 
+    if dry_run; then
+        plan "$(t 'download it and unpack the tree' '下载并解开源码树')"
+        return 0
+    fi
+
     SOURCE_ARCHIVE=$FINX_TMP/finx-source.tar.gz
     fetch_one "$src_url" "$SOURCE_ARCHIVE" \
         || die "cannot download the source archive from $src_url"
@@ -1329,6 +1443,14 @@ require_bootstrap_prerequisites() {
 # 跑 bootstrap。第一次自举会现编 tar 与 dpkg，慢是正常的。
 run_bootstrap() {
     target=$1
+
+    # 放在前置检查之前：试运行不该因为本机没有 Xcode CLT 就中断，那样会把后面
+    # 那一整段计划也吞掉。缺什么写进提示里就够了。
+    if dry_run; then
+        plan "$(t 'run the bootstrap, which compiles tar and dpkg (needs the Xcode Command Line Tools, 10-20 minutes)' \
+                 '运行自举，期间现编 tar 与 dpkg（需要 Xcode 命令行工具，10–20 分钟）')"
+        return 0
+    fi
 
     require_bootstrap_prerequisites
 
@@ -1376,6 +1498,10 @@ run_bootstrap() {
     # 默认把 bootstrap 的全部输出收进日志：它会逐条打印 mkdir、编译每一行、还有
     # 出错时的那套「该找哪个邮件列表」模板，几百行下去把真正要看的三行冲掉。
     # 失败时只回放末尾，够定位；要看全程就 --verbose。
+    # bootstrap 失败是**预期路径**：下面要回放日志末尾再决定说什么。所以这段
+    # 必须让 set -e 让路，否则命令一非零就退出，诊断分支永远走不到。
+    _had_errexit=0
+    case $- in *e*) _had_errexit=1; set +e ;; esac
     if [ "${VERBOSE:-0}" -eq 1 ]; then
         ( cd "$SOURCE_ROOT" && ${sudo_cmd[@]+"${sudo_cmd[@]}"} ./bootstrap "$target" < /dev/null ) \
             2>&1 | tee "$bootstrap_log"
@@ -1385,6 +1511,7 @@ run_bootstrap() {
             > "$bootstrap_log" 2>&1
         rc=$?
     fi
+    if [ "$_had_errexit" -eq 1 ]; then set -e; fi
 
     if [ "$rc" -ne 0 ]; then
         printf '\n' >&2
@@ -1395,10 +1522,13 @@ run_bootstrap() {
     fi
 }
 
-# ======== install.sh.in ========
+# ---- 默认状态 ------------------------------------------------------------
+#
+# 这一段的顺序是有意的：先定默认值，再解析参数，再校验。FINX_INDEX_DOMAIN 之类
+# 的规范化放在校验里，所以参数解析阶段拿到的是用户原样写的东西。
 PREFIX=/opt/finx
 PREFIX_EXPLICIT=0
-NO_PATH=0
+DRY_RUN=0
 CI=0
 ACCEPT_LICENSE=0
 SEED_DIR=""
@@ -1431,7 +1561,14 @@ Usage: install.sh [options]
   --source-url=URL    source archive to build (default: codeload tar.gz)
   --ref=REF           branch or commit for the default source archive (default: main)
   --no-fallback       fail when no seed is reachable instead of building from source
-  --no-path           leave your shell startup file alone
+  --dry-run           work out what would happen, print it, and change nothing.
+                      No network access at all: it prints the addresses it
+                      would ask, and the plan for both outcomes (a seed answers
+                      / none answers) instead of guessing. Host detection is
+                      real, because that part is local. An existing
+                      installation, or a prefix this user cannot write, does
+                      not stop it: both are reported as what a real run would
+                      hit. Nothing under the prefix and no licence prompt.
   --ci                no interaction: the agreement is accepted automatically.
                       Required when there is no terminal to ask (scripts, CI).
                       --accept-license is an alias that says the same thing
@@ -1490,7 +1627,7 @@ parse_args() {
             --ref=*)          SOURCE_REF=${1#*=} ;;
             --ref)            shift; [ $# -gt 0 ] || die "--ref needs a value"; SOURCE_REF=$1 ;;
             --no-fallback)    ALLOW_FALLBACK=0 ;;
-            --no-path)        NO_PATH=1 ;;
+            --dry-run|--dryrun|-n) DRY_RUN=1 ;;
             --ci|--CI)        CI=1 ;;
             --accept-license) CI=1; ACCEPT_LICENSE=1 ;;
             --zh)             ZH=1 ;;
@@ -1522,38 +1659,47 @@ check_target() {
         empty)
             warn "$PREFIX exists and is empty; continuing" ;;
         existing)
-            [ "$FORCE" -eq 1 ] || die "$PREFIX already holds an installation; re-run with --force to replace it"
-            warn "$(t 'replacing the existing installation in' '覆盖已安装的内容：') $PREFIX" ;;
+            if dry_run; then
+                # 开发者机器上本来就有一份安装，这是常态。预演在这里退出的话，
+                # 在这台机器上写 finx 的人永远看不到自己的计划。
+                warn "$(t 'dry run:' '试运行：') $PREFIX $(t 'already holds an installation; a real run would need --force' '已有一份安装，真正安装要加 --force')"
+            else
+                [ "$FORCE" -eq 1 ] || die "$PREFIX already holds an installation; re-run with --force to replace it"
+                warn "$(t 'replacing the existing installation in' '覆盖已安装的内容：') $PREFIX"
+            fi ;;
         *)
-            [ "$FORCE" -eq 1 ] || die "$PREFIX is not empty and does not look like a Finx installation.
+            if dry_run; then
+                warn "$(t 'dry run:' '试运行：') $PREFIX $(t 'is not a Finx installation; a real run would need --force' '不像一份 Finx 安装，真正安装要加 --force')"
+            else
+                [ "$FORCE" -eq 1 ] || die "$PREFIX is not empty and does not look like a Finx installation.
        This is usually what a source build leaves behind when it stops halfway.
        Inspect it, then either remove it or re-run with --force:
          sudo ls -la $PREFIX
          sudo rm -rf $PREFIX"
-            warn "$PREFIX is not a Finx installation; continuing because --force was given" ;;
+                warn "$PREFIX is not a Finx installation; continuing because --force was given"
+            fi ;;
     esac
 }
 
-# 装完之后 finx 还不在 PATH 上 —— 子进程改不了父 shell 的环境变量，
-# 所以只有两条路：让用户自己 source，或写进 shell 的启动文件。
-#
-# 这里不自动写启动文件。这个安装器的典型用法是 `curl ... | bash`，
-# 在用户没看清的情况下改 .zprofile 是坏做法，而且改错了很难发现。
-# 所以：按用户的登录 shell 给出**精确到文件**的那一行，用户可以复制粘贴；
-# 想让它代劳的，指向随包安装的 pathsetup.sh。
 # ---------------------------------------------------------------------------
 # 让 finx 在当前 shell 与今后的 shell 里都能直接用
 # ---------------------------------------------------------------------------
 #
-# 脚本改不了父 shell 的 PATH —— 子进程影响不了父进程。所以能做的只有两件：
-# 写进 shell 的启动文件（持久），以及告诉用户这一句怎么 source（当次生效）。
+# 脚本改不了父 shell 的 PATH —— 子进程影响不了父进程。安装器能做的是打印
+# 两条命令：当次生效的 source，和追加进启动文件的那一行。**它自己不动手**。
 #
-# 写启动文件有个必须小心的前提：安装器可能以 root 跑（`curl | sudo bash`），
-# 那时 $HOME 是 /var/root。往 root 的 .zprofile 里加东西既没用又有害。
-# 所以先解析出「真正在用的那个用户」的家目录（$SUDO_USER + Directory
-# Services），写完之后再把属主改回去。
+# 不替用户写启动文件，理由与 MacWave 相同：
+#   - 卸载要把它摘掉，只能靠字符串匹配去猜，猜错就是删掉别人的行；
+#   - 前缀变了或重装到别处，用户文件里留的是旧路径，安装器没法判断那一行
+#     还是不是自己写的；
+#   - 升级与卸载于是完全不必碰用户的文件。
+#
+# 剩下要小心的是「选哪个文件」：安装器可能以 root 跑（`curl | sudo bash`），
+# 那时 $HOME 是 /var/root，而用户要在自己的 shell 里执行这条命令 —— 所以打印
+# 时一律用 ~，不用展开后的路径。
 
-# 正在以 root 跑时，找出调用者的家目录；否则就是 $HOME。
+# 正在以 root 跑时，找出调用者的家目录；否则就是 $HOME。只用来判断某个
+# 启动文件是否存在，不往任何地方写。
 target_home() {
     if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         # 不能写 ~/$SUDO_USER —— 那会拿到 /var/root/xxx。要问 Directory Services。
@@ -1570,9 +1716,8 @@ target_home() {
 login_shell_name() {
     # 先问 Directory Services 要「这个人的登录 shell」，而不是看 $SHELL。
     #
-    # sudo 会把 SHELL 换成 root 的（通常是 /bin/sh），于是 zsh 用户被写进了
-    # ~/.profile —— 他们的 shell 根本不读那个文件，装完等于没配 PATH。
-    # 实测踩过。
+    # sudo 会把 SHELL 换成 root 的（通常是 /bin/sh），于是 zsh 用户被告知去改
+    # ~/.profile —— 他们的 shell 根本不读那个文件，照着做等于没配。实测踩过。
     _user=${SUDO_USER:-}
     if [ -z "$_user" ] || [ "$_user" = root ]; then
         _user=$(id -un 2>/dev/null)
@@ -1587,25 +1732,29 @@ login_shell_name() {
     basename "${SHELL:-/bin/zsh}"
 }
 
-# 该往哪个启动文件里写。zsh 用 .zprofile（登录 shell 会读），bash 优先
-# .bash_profile（存在才是它），csh 用 .cshrc。
+# 该往哪个启动文件里加。返回 ~/... 而不是展开后的路径：这条命令会原样打印
+# 给用户复制，在用户自己的 shell 里 ~ 才是对的那个家目录。
+#
+# zsh 用 .zprofile、bash 用 .bash_profile（存在才是它）、csh 用 .login ——
+# 都是**登录** shell 读的那个。PATH 是登录级的东西：写进 .zshrc 会在每个
+# 交互 shell 再 prepend 一遍，`zsh -l` 套一层就堆一次；而 .zshrc 在非交互
+# shell 里根本不读，`ssh host cmd` 与 cron 就看不见。
 shell_rc_path() {
-    home=$1
     case $(login_shell_name) in
-        zsh)  printf '%s/.zprofile\n' "$home" ;;
+        zsh)  printf '~/.zprofile\n' ;;
         bash)
-            if [ -f "$home/.bash_profile" ]; then
-                printf '%s/.bash_profile\n' "$home"
+            if [ -f "$(target_home 2>/dev/null || printf '%s' "$HOME")/.bash_profile" ]; then
+                printf '~/.bash_profile\n'
             else
-                printf '%s/.profile\n' "$home"
+                printf '~/.profile\n'
             fi ;;
-        csh|tcsh) printf '%s/.cshrc\n' "$home" ;;
-        *)    printf '%s/.profile\n' "$home" ;;
+        csh|tcsh) printf '~/.login\n' ;;
+        *)    printf '~/.profile\n' ;;
     esac
 }
 
-# 要写进去的那一行。带 test -r 是为了在 finx 被删掉之后不会让每个新
-# shell 都报一次错。
+# 建议用户加进启动文件的那一行。带 test -r 是为了在 finx 被删掉之后不会让
+# 每个新 shell 都报一次错。
 shell_source_line() {
     case $(login_shell_name) in
         csh|tcsh) printf 'test -r %s/bin/init.csh && source %s/bin/init.csh\n' "$PREFIX" "$PREFIX" ;;
@@ -1613,73 +1762,56 @@ shell_source_line() {
     esac
 }
 
-# 只打印，不写。写失败、或用户明确不要时用。
+# 用户复制一次就够的那条命令。那一行里没有单引号，所以外面套单引号是安全的。
+shell_append_line() {
+    printf "echo '%s' >> %s\n" "$(shell_source_line)" "$(shell_rc_path)"
+}
+
+# 只打印，不写。
 print_path_help() {
-    printf '\n'
+    echo ""
     if [ "${ZH:-0}" -eq 1 ]; then
-        printf '在当前这个 shell 里立即生效：\n'
-        printf '    . %s/bin/init.sh\n' "$PREFIX"
-        printf '\n'
-        printf '要长期生效，把下面这行加进 shell 启动文件：\n'
-        printf '    %s\n' "$(shell_source_line)"
-        printf '\n'
-        printf '或者不加 --no-path 重跑一次安装器，它会替你写。\n'
-        printf '\n'
-        printf '注意：finx 用自己的前缀，不会遮蔽 /sw 下可能已存在的 Fink 安装。\n'
+        echo "若要在当前这个 shell 里立即生效，执行下列命令："
+        echo ""
+        echo -e "${YELLOW}    . $PREFIX/bin/init.sh${RESET}"
+        echo ""
+        echo "执行下列命令将 finx 添加到 PATH："
+        echo ""
+        echo -e "${YELLOW}    $(shell_append_line)${RESET}"
+        echo ""
+        echo "然后执行："
+        echo ""
+        echo -e "${YELLOW}    . $(shell_rc_path)${RESET}"
+        echo ""
+        echo "注意：finx 用自己的前缀，不会遮蔽 /sw 下可能已存在的 Fink 安装。"
+        echo ""
     else
-        printf 'To use finx in this shell now:\n'
-        printf '    . %s/bin/init.sh\n' "$PREFIX"
-        printf '\n'
-        printf 'To make it permanent, add this line to your shell startup file:\n'
-        printf '    %s\n' "$(shell_source_line)"
-        printf '\n'
-        printf 'Or re-run this installer without --no-path to have it done for you.\n'
-        printf '\n'
-        printf 'Note: finx uses its own prefix, so it never shadows a Fink\n'
-        printf 'installation that may already be present under /sw.\n'
+        echo "To use finx in this shell now:"
+        echo ""
+        echo -e "${YELLOW}    . $PREFIX/bin/init.sh${RESET}"
+        echo ""
+        echo "To add finx to PATH in every new terminal, run:"
+        echo ""
+        echo -e "${YELLOW}    $(shell_append_line)${RESET}"
+        echo ""
+        echo "Then run:"
+        echo ""
+        echo -e "${YELLOW}    . $(shell_rc_path)${RESET}"
+        echo ""
+        echo "Note: finx uses its own prefix, so it never shadows a Fink"
+        echo "installation that may already be present under /sw."
+        echo ""
     fi
 }
 
-# 默认就写。--no-path 关掉。
-setup_path() {
-    if [ "$NO_PATH" -eq 1 ]; then
-        info "$(t 'leaving your shell configuration alone (--no-path)' '不动你的 shell 配置（--no-path）')"
-        print_path_help
-        return 0
-    fi
-
-    home=$(target_home) || {
-        warn "cannot determine the invoking user's home directory"
-        print_path_help
-        return 0
-    }
-
-    rc=$(shell_rc_path "$home")
-    line=$(shell_source_line)
-
-    # 幂等：已经有了就别重复追加。
-    if grep -qxF "$line" "$rc" 2>/dev/null; then
-        info "$(t 'PATH setup already present in' 'PATH 已配置在') $rc"
-    elif printf '\n# Finx: put finx on PATH\n%s\n' "$line" >> "$rc" 2>/dev/null; then
-        info "$(t 'added finx to PATH in' '已把 finx 加入 PATH：') $rc"
-        # 以 root 写进别人的文件后要把属主还回去，否则那个用户今后改不了它。
-        if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-            chown "$SUDO_USER" "$rc" 2>/dev/null \
-                || warn "could not chown $rc back to $SUDO_USER"
-        fi
+# 收尾。没有开关 —— 这里没有任何写文件的路径，只有打印。
+explain_path() {
+    if dry_run; then
+        plan "$(t 'leaving your shell startup files alone' '不动你的 shell 启动文件')"
     else
-        warn "could not write $rc"
-        print_path_help
-        return 0
+        info "$(t 'leaving your shell startup files alone' '不动你的 shell 启动文件')"
     fi
-
-    printf '\n'
-    if [ "${ZH:-0}" -eq 1 ]; then
-        printf 'finx 已在新的终端里可用。当前这个终端需要手动加载：\n'
-    else
-        printf 'finx is now on PATH for new shells. For this one, run:\n'
-    fi
-    printf '    . %s/bin/init.sh\n' "$PREFIX"
+    print_path_help
 }
 
 main() {
@@ -1706,26 +1838,43 @@ main() {
     resolve_method
 
     case $MODE in
-        seed)   install_from_seed ;;
+        seed)
+            # 试运行且种子要联网才拿得到 → 走大纲；--seed-dir 是本地文件，照旧
+            # 走真实流程，那条路能报出真的种子名与大小。
+            if dry_run && [ -z "$SEED_DIR" ]; then
+                step "$(t 'Installing from a seed' '从种子安装')"
+                plan_seed_install
+            else
+                install_from_seed
+            fi ;;
         source) install_from_source ;;
+        # 只有试运行会走到这里：不联网就判不出有没有种子，两条分支都打出来。
+        unknown)
+            step "$(t 'If a seed answers: installing from a seed' '如果种子可用：从种子安装')"
+            plan_seed_install
+            step "$(t 'Otherwise: building from source' '否则：源码自举')"
+            install_from_source ;;
     esac
 
-    # 装完了，但还没告诉用户「装好了」，也还没碰 shell 的启动文件。
-    # MacWave 在同一个位置问，理由一样：先宣告成功、再因为不同意而删掉，
-    # 是最难看的顺序。
+    # 装完了，但还没告诉用户「装好了」。MacWave 在同一个位置问，理由一样：
+    # 先宣告成功、再因为不同意而删掉，是最难看的顺序。
     printf '\n'
     license_gate
 
     printf '\n'
-    info "$(t 'Finx' 'Finx') ${INSTALLED_RELEASE:-unknown} $(t 'installed in' '已安装到') $PREFIX"
-    setup_path
-    info "$(t 'Package operations run as root, like MacPorts; finx asks for sudo itself.' \
-             '装包操作以 root 运行（与 MacPorts 相同），finx 会自己调用 sudo。')"
+    if dry_run; then
+        info "$(t 'dry run finished: nothing was changed' '试运行结束：没有做任何改动')"
+    else
+        info "$(t 'Finx' 'Finx') ${INSTALLED_RELEASE:-unknown} $(t 'installed in' '已安装到') $PREFIX"
+    fi
+    explain_path
+    printf '%s\n' "$(t 'Package operations run as root, like MacPorts; finx asks for sudo itself.' \
+                      '装包操作以 root 运行（与 MacPorts 相同），finx 会自己调用 sudo。')"
     printf '\n'
-    info "$(t 'Read LICENSE and COPYING again any time, in English or in Chinese:' \
-             'LICENSE 与 COPYING 随时可再读，中英各一版：')"
-    info "$(t '  https://finx.sh   the two file names at the bottom open them.' \
-             '  https://finx.sh   点开页面底部那两个文件名即可。')"
+    printf '%s\n' "$(t 'Read LICENSE and COPYING again any time, in English or in Chinese:' \
+                      'LICENSE 与 COPYING 随时可再读，中英各一版：')"
+    printf '%s\n' "$(t 'https://finx.sh   the two file names at the bottom open them.' \
+                      'https://finx.sh   点开页面底部那两个文件名即可。')"
 }
 
 # 种子优先，取不到再退回源码。显式给了 --seed-dir / --manifest-url 时不回落，
@@ -1734,6 +1883,10 @@ resolve_method() {
     if [ -n "$SEED_DIR" ] || [ -n "$MANIFEST_URL" ]; then
         MODE=seed
         info "$(t 'seed, from an explicit location' '种子，来自显式指定的位置')"
+        # 试运行不取清单，但这个地址是调用方给的，至少让它看见自己给了什么
+        if dry_run && [ -z "$SEED_DIR" ]; then
+            info "  $(redact_url "$MANIFEST_URL")"
+        fi
         return 0
     fi
 
@@ -1746,24 +1899,111 @@ resolve_method() {
     if [ "$ALLOW_FALLBACK" -eq 0 ]; then
         MODE=seed
         info "$(t 'seed, from the default manifest' '种子，来自默认清单')"
+        # 试运行不取它，但唯一的来源该让用户看见
+        if dry_run; then
+            info "  $(redact_url "$DEFAULT_MANIFEST_URL")"
+        fi
         return 0
     fi
 
-    MANIFEST_URL=$DEFAULT_MANIFEST_URL
-    # 探测最多要一两分钟（重试 + 超时），期间不能一声不响 —— 用户会以为卡死。
-    info "$(t 'looking for a seed manifest' '正在查找种子清单')"
-    info "  $(redact_url "$MANIFEST_URL")"
-    probe_url "$MANIFEST_URL"
-    case $? in
-        0)
-            MODE=seed
-            # 清单在，但种子未必是给这台机器的（arch / darwin 不匹配）。允许换路，
-            # 交给 resolve_manifest 判定后回退源码；--no-fallback 与显式来源不换。
-            SEED_MAY_FALL_BACK=1
-            info "$(t 'seed, from' '种子，来自') $(redact_url "$MANIFEST_URL")" ;;
-        1)
+    # 从本机的 Darwin 主版本**往下**找，直到 21（第一个有种子的版本）。
+    #
+    # 为什么往下找而不是只认本机那一版：二进制记的是构建时的 Darwin，
+    # 低处编的能在高处跑，反之不行（见 docs/MIRRORS.md 三点六）。所以
+    # macOS 14 上没有 seed-23 时，seed-21 完全可用 —— 而只认精确匹配的话，
+    # 用户会被无谓地送去源码编译半小时。
+    #
+    # 三个终止条件都要有：
+    #   - 探到 → 用它
+    #   - 明确不存在（服务端回 404）→ 继续往下试
+    #   - 探不出来（连不上/超时）→ 停，这不是「没有」而是「问不到」，
+    #     再往下试只会让用户多等好几轮超时
+    #
+    # 最低到 21：更早的 Darwin 没有种子，也就没有往下试的意义。
+    FINX_LOWEST_SEED_DARWIN=${FINX_LOWEST_SEED_DARWIN:-21}
+
+    # 试运行不访问网络，「有没有种子」因此没有答案 —— 只能把会试的地址按顺序
+    # 列出来，把两种分支的计划交给 main 打。
+    #
+    # 不许猜一个：猜 exists 是假的乐观，猜 absent 会让人白等十来分钟去编译源码。
+    # 而这一步又恰好是最慢的一段（连不上时要跑完超时重试），静默两分钟与卡死
+    # 在用户眼里是同一件事。
+    if dry_run; then
+        info "$(t 'dry run: the network is not touched, so this cannot be decided here' \
+                 '试运行：不访问网络，所以这里判不出结果')"
+        if [ -n "${FINX_DEFAULT_MANIFEST_URL:-}" ] || [ -n "${FINX_INDEX_DOMAIN_GIVEN:-}" ]; then
+            info "$(t 'would look for a seed manifest at' '将会查找种子清单：')"
+            info "  $(redact_url "$DEFAULT_MANIFEST_URL")"
+        else
+            info "$(t 'would look for a seed manifest at these addresses, stopping at the first answer:' \
+                     '将会按顺序查找这些种子清单，遇到第一个有应答的就停：')"
+            _cand=$FINX_HOST_DARWIN
+            case $_cand in
+                ''|*[!0-9]*|0) _cand=$FINX_LOWEST_SEED_DARWIN ;;
+            esac
+            while [ "$_cand" -ge "$FINX_LOWEST_SEED_DARWIN" ]; do
+                info "  $(redact_url "$FINX_SEED_BASE/seed-$_cand/manifest")"
+                _cand=$((_cand - 1))
+            done
+        fi
+        MODE=unknown
+        return 0
+    fi
+    # 显式给了清单地址（--manifest-url 已在上面处理过）或 FINX_INDEX_DOMAIN，
+    # 就不做「往下找」：调用方指定了来源，再换一个等于把他的指定丢掉。
+    if [ -n "${FINX_DEFAULT_MANIFEST_URL:-}" ] || [ -n "${FINX_INDEX_DOMAIN_GIVEN:-}" ]; then
+        MANIFEST_URL=$DEFAULT_MANIFEST_URL
+        info "$(t 'looking for a seed manifest' '正在查找种子清单')"
+        info "  $(redact_url "$MANIFEST_URL")"
+        probe_url "$MANIFEST_URL"
+        _rc=$PROBE_RESULT
+        _cand=$FINX_HOST_DARWIN
+    else
+    _cand=$FINX_HOST_DARWIN
+    case $_cand in
+        ''|*[!0-9]*|0) _cand=$FINX_LOWEST_SEED_DARWIN ;;
+    esac
+    MANIFEST_URL=""
+    while [ "$_cand" -ge "$FINX_LOWEST_SEED_DARWIN" ]; do
+        _url="$FINX_SEED_BASE/seed-$_cand/manifest"
+        # 探测最多要一两分钟（重试 + 超时），期间不能一声不响 —— 用户会以为卡死。
+        info "$(t 'looking for a seed manifest' '正在查找种子清单')"
+        info "  $(redact_url "$_url")"
+        probe_url "$_url"
+        _rc=$PROBE_RESULT
+        if [ "$_rc" = exists ]; then
+            MANIFEST_URL=$_url
+            break
+        elif [ "$_rc" != absent ]; then
+            # 探不出来：不是「没有」，而是「问不到」。再往下试只会让用户多等
+            # 好几轮超时，而且结论一样不可靠 —— 停下来，把它当网络问题报。
+            MANIFEST_URL=$_url
+            break
+        fi
+        # 这一版确实没有，试下一档
+        info "  $(t 'no seed for this system, trying an older build' '本机这一版没有种子，试更低一档')"
+        _cand=$((_cand - 1))
+    done
+    fi
+
+    if [ -n "$MANIFEST_URL" ] && [ "$_rc" = exists ]; then
+        MODE=seed
+        # 清单在，但种子未必是给这台机器的（arch / darwin 不匹配）。允许换路，
+        # 交给 resolve_manifest 判定后回退源码；--no-fallback 与显式来源不换。
+        SEED_MAY_FALL_BACK=1
+        info "$(t 'seed, from' '种子，来自') $(redact_url "$MANIFEST_URL")"
+    elif [ -n "$MANIFEST_URL" ]; then
+        # 探不出来那一路，交给下面 case 的 * 分支处理
+        :
+    else
+        MANIFEST_URL=$DEFAULT_MANIFEST_URL
+    fi
+
+    case ${_rc:-unknown} in
+        exists) ;;
+        absent)
             MODE=source
-            warn "no seed manifest at $(redact_url "$MANIFEST_URL") yet; falling back to a source build"
+            warn "no seed manifest for Darwin $FINX_HOST_DARWIN or below; falling back to a source build"
             warn "that path needs the Xcode Command Line Tools and compiles tar and dpkg" ;;
         *)
             # 探不出来 ≠ 没有种子。源码那条路要去 SourceForge 下载，连不上
@@ -1806,6 +2046,27 @@ resolve_method() {
             printf 'SourceForge, which this network is unlikely to reach either.\n' >&2
             exit 1 ;;
     esac
+}
+
+# 试运行专用：种子这条路会做什么。
+#
+# 为什么不调 install_from_seed：它的第一步是把清单取下来，而种子名、大小与
+# sha256 都写在清单里 —— 试运行不联网就一个也拿不到，只能编。所以这里按真实
+# 步骤写一份大纲，步骤名与 install_from_seed 一一对应，改那边时回来改这里。
+#
+# --seed-dir 不走这里：清单是本地文件，那条路能真解析出名字与大小。
+plan_seed_install() {
+    plan "$(t 'download the manifest and read the seed name, size and sha256 from it' \
+             '下载清单，从里面读出种子名、大小与 sha256')"
+    plan "$(t 'download that seed' '下载这份种子')"
+    plan "$(t 'check its sha256 and size' '校验 sha256 与大小')"
+    plan "$(t 'confirm the archive really contains' '确认归档里有') bin/finx bin/dpkg bin/dpkg-deb"
+    plan "$(t 'create' '建立') $PREFIX"
+    plan "$(t 'extract the archive into' '解开归档到') $PREFIX"
+    plan "$(t 'set ownership and modes, re-sign the Mach-O files, align the tree links, repair alternatives' \
+             '规范权限、重签 Mach-O、对齐 trees、修补 alternatives')"
+    plan "$(t 'write' '写入') $PREFIX/etc/finx.conf"
+    plan "$(t 'rebuild the package index in' '重建包索引') $PREFIX"
 }
 
 install_from_seed() {
@@ -1865,7 +2126,19 @@ install_from_source() {
     step "$(t 'Bootstrapping' '自举')"
     run_bootstrap "$PREFIX"
 
-    INSTALLED_RELEASE=$(cat "$SOURCE_ROOT/VERSION" 2>/dev/null || echo unknown)
+    # 试运行没有真的下载，SOURCE_ROOT 是空的；`set -u` 下读它就是报错
+    if dry_run; then
+        INSTALLED_RELEASE=unknown
+    else
+        INSTALLED_RELEASE=$(cat "$SOURCE_ROOT/VERSION" 2>/dev/null || echo unknown)
+    fi
 }
+
+# 自检要单独测某些函数（redact_url、probe_url、finx_domain…），那需要把本文件
+# source 进来而不跑安装。FINX_SOURCE_ONLY=1 就是那个开关：只定义函数，不执行
+# main。默认仍然执行，`curl | bash` 不受影响。
+if [ "${FINX_SOURCE_ONLY:-0}" -eq 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 main "$@"
