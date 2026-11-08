@@ -67,6 +67,12 @@ BOLD_BLUE='\033[1;38;5;25m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
+# 程序标记，与 finx 本体的 Fink::Color::$PROG_MARK 同一个字（那里写成 UTF-8
+# 字节，因为 Perl 的 STDOUT 没有 :utf8 层；bash 直接写字面量即可）。
+# 定义在这里而不是 warn/die 旁边：下面两处「还没读到函数定义就得报错」的
+# 校验也要用它。
+MARK='🧩'
+
 print_banner() {
     echo ""
     echo -e "${GREEN}███████╗██╗███╗   ██╗██╗  ██╗${RESET}"
@@ -112,8 +118,8 @@ finx_domain() {
         http://127.0.0.1:?*|http://localhost:?*) printf '%s\n' "$_finx_value"; return 0 ;;
     esac
 
-    printf 'ERROR: %s must be an https:// (or file://) address, got: %s\n' \
-        "$_finx_name" "$_finx_value" >&2
+    printf "${RED_BOLD}%s ERROR: %s must be an https:// (or file://) address, got: %s${RESET}\n" \
+        "$MARK" "$_finx_name" "$_finx_value" >&2
     exit 1
 }
 
@@ -158,8 +164,8 @@ export FINX_SOURCE_DOMAIN
 # 这里用裸 printf 而不是 die()：die 定义在后面，且本文件按顺序被 source。
 case ${FINX_CONNECT_TIMEOUT:-30} in
     ''|*[!0-9]*)
-        printf 'ERROR: FINX_CONNECT_TIMEOUT must be a whole number of seconds, got: %s\n' \
-            "$FINX_CONNECT_TIMEOUT" >&2
+        printf "${RED_BOLD}%s ERROR: FINX_CONNECT_TIMEOUT must be a whole number of seconds, got: %s${RESET}\n" \
+            "$MARK" "$FINX_CONNECT_TIMEOUT" >&2
         exit 1 ;;
 esac
 FINX_CONNECT_TIMEOUT=${FINX_CONNECT_TIMEOUT:-30}
@@ -242,7 +248,7 @@ Re-run interactively, or pass --ci after reading both files.' \
             echo -e "${GREEN}$(t 'You have agreed to the agreement.' \
                                 '已记录你的同意。')${RESET}" ;;
         *)
-            echo -e "${RED_BOLD}$(t 'You do not agree to the agreement. Installation stopped.' \
+            echo -e "${RED_BOLD}${MARK} $(t 'You do not agree to the agreement. Installation stopped.' \
                                     '你未同意该协议，安装已停止。')${RESET}" >&2
             agreement_rollback
             exit 1 ;;
@@ -259,7 +265,7 @@ agreement_rollback() {
         absent)
             info "$(t 'removing' '正在删除') $PREFIX"
             if rm -rf "$PREFIX"; then
-                echo -e "${RED_BOLD}$(t 'Everything this run created has been removed.' \
+                echo -e "${RED_BOLD}${MARK} $(t 'Everything this run created has been removed.' \
                                         '本次创建的内容已全部删除。')${RESET}" >&2
             else
                 warn "$(t "could not remove $PREFIX; inspect it by hand" \
@@ -294,19 +300,23 @@ info() {
     printf '    %s\n' "$*"
 }
 
+# 诊断消息的样式与 finx 本体一致：段首一个 🧩（Fink::Color 的 $PROG_MARK，
+# 那里写成 UTF-8 字节；这里是 bash，直接写字面量），错误用 RED_BOLD、警告用
+# YELLOW。两个函数是所有 stderr 提示的**唯一**出口 —— 散在各处 printf 的话，
+# 迟早有一条忘了上色。
 warn() {
     if [ "${ZH:-0}" -eq 1 ]; then
-        printf '警告: %s\n' "$*" >&2
+        printf "${YELLOW}%s 警告: %s${RESET}\n" "$MARK" "$*" >&2
     else
-        printf 'WARNING: %s\n' "$*" >&2
+        printf "${YELLOW}%s WARNING: %s${RESET}\n" "$MARK" "$*" >&2
     fi
 }
 
 die() {
     if [ "${ZH:-0}" -eq 1 ]; then
-        printf '错误: %s\n' "$*" >&2
+        printf "${RED_BOLD}%s 错误: %s${RESET}\n" "$MARK" "$*" >&2
     else
-        printf 'ERROR: %s\n' "$*" >&2
+        printf "${RED_BOLD}%s ERROR: %s${RESET}\n" "$MARK" "$*" >&2
     fi
     exit 1
 }
