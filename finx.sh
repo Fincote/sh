@@ -720,13 +720,18 @@ probe_url() {
 
     PROBE_ATTEMPTS=0
     total=$tries
+    # 每一次都要说一声，不只是重试那次。弱网下第一探就能耗掉二十秒，期间一个
+    # 字都没有，与「卡死」在用户眼里是同一件事。
+    info "  $(t 'waiting for an answer (up to' '等待应答（最多') $((total * 20)) $(t 'seconds)' '秒）')"
     while [ "$tries" -gt 0 ]; do
         PROBE_ATTEMPTS=$((PROBE_ATTEMPTS + 1))
         attempt=$PROBE_ATTEMPTS
-        [ "$attempt" -gt 1 ] && info "  no answer yet (attempt $attempt of $total)"
+        [ "$attempt" -gt 1 ] && info "  $(t 'no answer yet, attempt' '还没有应答，第') $attempt $(t 'of' '次，共') $total"
 
+        # 不写 --retry：它让一次「尝试」在最坏情况下翻倍到四十秒，而外面这层
+        # 本来就重试三次。去掉之后单次最多二十秒，总时长可预期。
         code=$(curl -sS -o /dev/null -w '%{http_code}' -I \
-            --connect-timeout 10 --max-time 20 --retry 1 "$url" 2>/dev/null) || code=000
+            --connect-timeout 10 --max-time 20 "$url" 2>/dev/null) || code=000
 
         # HEAD 会被某些 CDN / 反爬层拒掉（403/405/501），而同一个地址用 GET
         # 取两个字节就正常。所以 HEAD 被拒时再问一次 GET。
@@ -736,7 +741,7 @@ probe_url() {
         case $code in
             403|405|429|501)
                 code=$(curl -sS -o /dev/null -w '%{http_code}' -r 0-1 -L \
-                    --connect-timeout 10 --max-time 20 --retry 1 "$url" 2>/dev/null) \
+                    --connect-timeout 10 --max-time 20 "$url" 2>/dev/null) \
                     || code=000 ;;
         esac
 
